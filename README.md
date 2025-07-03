@@ -1,7 +1,7 @@
 
 
 
-//code is here
+//Arduino code is here
 
 #include <WiFi.h>
 #include <WebServer.h>
