@@ -1,0 +1,256 @@
+classdef AquaSense < matlab.apps.AppBase
+
+    % Properties that correspond to app components
+    properties (Access = public)
+        UIFigure            matlab.ui.Figure
+        LampIndicator       matlab.ui.control.Lamp
+        LampIndicatorLabel  matlab.ui.control.Label
+        StatusLabel         matlab.ui.control.Label
+        ButtonOn            matlab.ui.control.Button
+        ButtonOff           matlab.ui.control.Button
+        ButtonAuto          matlab.ui.control.Button
+        UIAxes1             matlab.ui.control.UIAxes
+    end
+
+    
+    properties (Access = private)
+    esp32           % Serial port object
+    timerObj        % Timer object for reading serial data
+    tempData = []   % Temperature data storage
+    humidityData = [] % Humidity data storage
+    timeStamps = [] % Time series for plotting
+    anfisModel      % AI model (e.g., ANFIS)
+    end
+    
+
+    % Callbacks that handle component events
+    methods (Access = private)
+
+        % Code that executes after component creation
+        function startupFcn(app)
+    % Code that executes after component creation
+    try
+        % Initialize serial port
+        app.esp32 = serialport("COM3", 115200);  % Update COM port as needed
+        configureTerminator(app.esp32, "LF");
+        flush(app.esp32);
+
+        % Load the trained FIS model using a relative path
+        appFolder = fileparts(mfilename('fullpath'));  % Gets path of the app
+        modelPath = fullfile(appFolder, 'trainedFIS.mat');  % Adjust if in subfolder
+        loaded = load(modelPath, 'trainedFIS');
+        app.anfisModel = loaded.trainedFIS;
+
+        % Initialize arrays
+        app.timeStamps = datetime.empty(0, 1);
+        app.tempData = [];
+        app.humidityData = [];
+
+        % Start a timer to read data from ESP32 every second
+        app.timerObj = timer( ...
+            'ExecutionMode', 'fixedRate', ...
+            'Period', 1, ...
+            'TimerFcn', @(~,~)readSerialData(app));
+        start(app.timerObj);
+
+        app.StatusLabel.Text = "Connected to ESP32";  % Optional status update
+    catch e
+        app.StatusLabel.Text = "Failed to connect";
+        disp(e.message);
+    end
+end
+
+
+    function readSerialData(app)
+    try
+        if isvalid(app.esp32) && app.esp32.NumBytesAvailable > 0
+            pause(0.35);  % Let ESP32 finish sending full response
+            rawData = readline(app.esp32);
+            disp(['Raw: ', rawData]);
+
+            % Parse the 5 comma-separated values from ESP32
+            parts = split(strtrim(rawData), ',');
+            if numel(parts) == 5
+                temp = str2double(parts{1});
+                temp2 = str2double(parts{2});
+                hum = str2double(parts{3});
+                hum2 = str2double(parts{4});
+                interaction = str2double(parts{5});
+
+                % Ensure values are valid
+                if all(~isnan([temp, temp2, hum, hum2, interaction]))
+                    % Plot only temperature and humidity
+                    timestamp = datetime('now');
+                    app.tempData(end+1) = temp;
+                    app.humidityData(end+1) = hum;
+                    app.timeStamps(end+1) = timestamp;
+
+                    plot(app.UIAxes1, app.timeStamps, app.tempData, '-r', 'DisplayName', 'Temperature');
+                    hold(app.UIAxes1, 'on');
+                    plot(app.UIAxes1, app.timeStamps, app.humidityData, '-b', 'DisplayName', 'Humidity');
+                    hold(app.UIAxes1, 'off');
+                    title(app.UIAxes1, 'Temperature and Humidity');
+                    ylabel(app.UIAxes1, 'Value');
+                    xlabel(app.UIAxes1, 'Time');
+                    legend(app.UIAxes1, 'show');
+                    drawnow;
+
+                    % Predict ET using ANFIS model
+                    inputVec = [temp, temp2, hum, hum2, interaction];
+                    ET = evalfis(app.anfisModel, inputVec);
+                    %disp(['Computed ET: ', num2str(ET)]);
+
+                    % Send ET back to ESP32
+                    writeline(app.esp32, num2str(ET));
+                end
+            else
+                %disp('Received line does not have 5 parts.');
+            end
+        end
+    catch e
+       % disp(['Error in readSerialData: ', e.message]);
+    end
+    
+        end
+
+        % Button pushed function: ButtonOn
+        function ButtonOnPushed(app, event)
+            app.LampIndicator.Color = 'green';  % Turn on the lamp (green)
+            app.StatusLabel.Text = 'System ON';
+            writeline(app.esp32, '1');  % Send 'A' to the ESP32 (for Auto Mode)
+            pause(0.35);  % Add a delay to match ESP32 response delay
+        end
+
+        % Button pushed function: ButtonOff
+        function ButtonOffPushed(app, event)
+            app.LampIndicator.Color = 'red';  % Turn off the lamp (red)
+            app.StatusLabel.Text = 'System OFF';
+            writeline(app.esp32, '0');  % Send 'a' to the ESP32 (for Auto Mode)
+            pause(0.35);  % Add a delay to match ESP32 response delay
+        end
+
+        % Button pushed function: ButtonAuto
+        function ButtonAutoPushed(app, event)
+        try
+        flush(app.esp32);  % Clear serial buffer before switching mode
+        writeline(app.esp32, 'A');  % Command to enter Auto mode
+
+        app.StatusLabel.Text = 'Switching to Auto Mode...';
+
+        % Optional quick check: wait for ESP32 to acknowledge
+        pause(0.1);  % small wait just to ensure write completes
+        if app.esp32.NumBytesAvailable > 0
+            response = readline(app.esp32);
+            disp(['ESP32 says: ', response]);
+        end
+
+        app.StatusLabel.Text = 'Auto Mode';
+        app.LampIndicator.Color = [0.2 0.8 0.2];  % Optional: soft green for auto mode
+    catch e
+        disp(['Error switching to Auto Mode: ', e.message]);
+        app.StatusLabel.Text = 'Auto Mode Failed';
+        end
+
+        end
+    end
+
+    % Component initialization
+    methods (Access = private)
+
+        % Create UIFigure and components
+        function createComponents(app)
+
+            % Create UIFigure and hide until all components are created
+            app.UIFigure = uifigure('Visible', 'off');
+            app.UIFigure.Position = [100 100 640 480];
+            app.UIFigure.Name = 'MATLAB App';
+
+            % Create UIAxes1
+            app.UIAxes1 = uiaxes(app.UIFigure);
+            title(app.UIAxes1, 'Title')
+            xlabel(app.UIAxes1, 'X')
+            ylabel(app.UIAxes1, 'Y')
+            zlabel(app.UIAxes1, 'Z')
+            app.UIAxes1.FontName = 'Times New Roman';
+            app.UIAxes1.FontSize = 15;
+            app.UIAxes1.Position = [295 230 300 185];
+
+            % Create ButtonAuto
+            app.ButtonAuto = uibutton(app.UIFigure, 'push');
+            app.ButtonAuto.ButtonPushedFcn = createCallbackFcn(app, @ButtonAutoPushed, true);
+            app.ButtonAuto.BackgroundColor = [0 1 0];
+            app.ButtonAuto.FontSize = 35;
+            app.ButtonAuto.FontWeight = 'bold';
+            app.ButtonAuto.Position = [48 358 209 73];
+            app.ButtonAuto.Text = 'ButtonAuto';
+
+            % Create ButtonOff
+            app.ButtonOff = uibutton(app.UIFigure, 'push');
+            app.ButtonOff.ButtonPushedFcn = createCallbackFcn(app, @ButtonOffPushed, true);
+            app.ButtonOff.BackgroundColor = [1 1 0];
+            app.ButtonOff.FontSize = 30;
+            app.ButtonOff.FontWeight = 'bold';
+            app.ButtonOff.Position = [58 272 155 44];
+            app.ButtonOff.Text = 'ButtonOff';
+
+            % Create ButtonOn
+            app.ButtonOn = uibutton(app.UIFigure, 'push');
+            app.ButtonOn.ButtonPushedFcn = createCallbackFcn(app, @ButtonOnPushed, true);
+            app.ButtonOn.BackgroundColor = [0 0 1];
+            app.ButtonOn.FontSize = 30;
+            app.ButtonOn.FontWeight = 'bold';
+            app.ButtonOn.Position = [59 208 154 44];
+            app.ButtonOn.Text = 'ButtonOn';
+
+            % Create StatusLabel
+            app.StatusLabel = uilabel(app.UIFigure);
+            app.StatusLabel.FontSize = 33;
+            app.StatusLabel.FontWeight = 'bold';
+            app.StatusLabel.Position = [33 25 224 51];
+            app.StatusLabel.Text = 'StatusLabel';
+
+            % Create LampIndicatorLabel
+            app.LampIndicatorLabel = uilabel(app.UIFigure);
+            app.LampIndicatorLabel.HorizontalAlignment = 'right';
+            app.LampIndicatorLabel.FontSize = 30;
+            app.LampIndicatorLabel.FontWeight = 'bold';
+            app.LampIndicatorLabel.Position = [23 107 213 37];
+            app.LampIndicatorLabel.Text = 'LampIndicator';
+
+            % Create LampIndicator
+            app.LampIndicator = uilamp(app.UIFigure);
+            app.LampIndicator.Position = [251 110 63 63];
+
+            % Show the figure after all components are created
+            app.UIFigure.Visible = 'on';
+        end
+    end
+
+    % App creation and deletion
+    methods (Access = public)
+
+        % Construct app
+        function app = AquaSense
+
+            % Create UIFigure and components
+            createComponents(app)
+
+            % Register the app with App Designer
+            registerApp(app, app.UIFigure)
+
+            % Execute the startup function
+            runStartupFcn(app, @startupFcn)
+
+            if nargout == 0
+                clear app
+            end
+        end
+
+        % Code that executes before app deletion
+        function delete(app)
+
+            % Delete UIFigure when app is deleted
+            delete(app.UIFigure)
+        end
+    end
+end
